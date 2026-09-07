@@ -15,15 +15,7 @@ runs:
       uses: go-task/setup-task@v2
       with:
         repo-token: ${{ inputs.github-token }}
-        version: 3.52.0
-
-    - uses: baptiste0928/cargo-install@v3
-      with:
-        crate: cargo-insta
-
-    - uses: baptiste0928/cargo-install@v3
-      with:
-        crate: cargo-nextest
+        version: 3.53.1
 
     - run: ./.github/workflows/scripts/set_version.sh
       shell: bash

@@ -25,11 +25,114 @@
 
 **Fixes**:
 
+- `prqlc lsp` now reports that `prqlc` was built without the `lsp` feature,
+  rather than panicking with `internal error: entered unreachable code`. The
+  subcommand is registered in every build, but the feature is off by default, so
+  the released binaries were affected. (@prql-bot, #6221)
+
+- Deserializing an ident with an empty path now reports an error rather than
+  panicking. A document containing `{"Ident":[]}` passed to `json::to_pl` or
+  `json::to_rq` — reachable from the Python and JS bindings — hit
+  `path.pop().unwrap()`; it now reports
+  `invalid length 0, expected an ident with at least one part`. (@prql-bot,
+  #6223)
+
+- `prqlc experimental highlight` now preserves the whitespace around `..`. It
+  previously printed a bare `..` for every range token, which could turn the
+  highlighted output into a different program than the input — `take 1 .. 5` is
+  a compile error, but it was rendered as `take 1..5`, which compiles to
+  `LIMIT 5`. (@prql-bot, #6232)
+
+- `prqlc lsp` now answers a request for an unimplemented method with a
+  `MethodNotFound` error rather than dropping it. Only `textDocument/definition`
+  and `shutdown` are handled, and every other request fell through the match
+  with no reply at all — LSP requires a response to every request, so a client
+  that waits on one hung. (@prql-bot, #6282)
+
+- The two errors from the self-equality operator — `==5` and `==x.y` in a `join`
+  — now report a source location. They were raised without a span, so they
+  printed as a bare `Error: self-equality operator requires a column name` with
+  no snippet pointing at the offending expression. (@prql-bot, #6283)
+
+- `text.contains` now compiles to `||` concatenation on the `sql.oracle` target,
+  rather than a three-argument `CONCAT`. Oracle's `CONCAT` takes exactly two
+  arguments before 23ai, so the generated query was rejected outright. This
+  matches the existing `sql.redshift` override. (@prql-bot, #6267)
+
+- `text.contains`, `text.starts_with` and `text.ends_with` now parenthesize
+  their argument on the `sql.sqlite` target. SQLite ranks `||` above both
+  `*`/`/`/`%` and `+`/`-`, so an arithmetic argument bound to the surrounding
+  `'%'` literals instead of to itself — `text.contains (a + b)` compiled to
+  `col LIKE '%' || a + b || '%'`, which SQLite parses as
+  `('%' || a) + (b || '%')` and evaluates to a number rather than a pattern.
+  (@prql-bot, #6272)
+
+- f-strings now parenthesize operand expressions on the `sql.sqlite` and
+  `sql.redshift` targets, which emit `||` rather than `CONCAT`. Operands were
+  passed through without any precedence check, so `f"pre{a * b}post"` compiled
+  to `'pre' || a * b || 'post'`, which SQLite parses as
+  `('pre' || a) * (b || 'post')` and evaluates to a number rather than a string.
+  `BETWEEN` operands, which bind looser than `||` in both dialects, are
+  parenthesized too. Operands that expand from an s-string still follow that
+  s-string's declared binding strength. (@prql-bot, #6273)
+
+- `text.contains`, `text.starts_with` and `text.ends_with` now parenthesize
+  their _result_ when it is used inside an f-string on the `sql.sqlite` and
+  `sql.redshift` targets. The definitions compile to a top-level `LIKE`, but
+  declared no `binding_strength`, so they reported the s-string default of `100`
+  and were emitted bare into the `||` chain. With
+  `c = (nm | text.contains 'z')`, `f"{c}!"` compiled to
+  `nm LIKE '%' || 'z' || '%' || '!'`, which tests `nm` against the pattern
+  `%z%!` rather than appending `'!'` to the result. They now declare `7`, where
+  `LIKE` ranks. (@prql-bot, #6285)
+
+- `math.log` and integer division (`//`) now declare the binding strength of the
+  operator they compile to, so they are parenthesized when used as an operand.
+  `math.log` compiles to a top-level `/` but declared none, so it reported the
+  s-string default of `100`: `1 / (a | math.log 2)` compiled to
+  `1 / LOG10(a) / LOG10(2)`, which divides by the product of the two logarithms
+  rather than by their quotient. The generic and `sql.sqlite` `div_i`
+  definitions end in `* SIGN(...) * SIGN(...)`, so their top-level operation is
+  a multiplication, but they declared `100` as though the leading `FLOOR`/`CAST`
+  call wrapped the whole body — `1 / (a // b)` compiled to
+  `1 / FLOOR(ABS(a / b)) * SIGN(a) * SIGN(b)`, multiplying by the signs instead
+  of dividing by the quotient. Both now declare `11`, where `*` and `/` rank.
+  (@prql-bot, #6286)
+
 **Documentation**:
+
+- The `prql-java` README now documents the actual API. It advertised a
+  single-argument `toSql(String query)` in package `org.prqllang.prql4j`; the
+  binding really exposes `toSql(query, target, format, signature)`, `toJson` and
+  `format` in package `org.prql.prql4j`, so the usage example as written would
+  not compile. `DEVELOPMENT.md` also described publishing to Maven as a working
+  step, but the `publish-prql-java` release job has been commented out since
+  #850 and no `org.prqllang` artifact exists on Maven Central. (@prql-bot,
+  #6281)
 
 **Web**:
 
+- The playground no longer depends on `web-vitals`. `reportWebVitals` was called
+  with no argument, and its body is guarded on that argument being a function —
+  so the dynamic `import("web-vitals")` inside it never ran. It was Create React
+  App boilerplate that outlived the migration to Vite. (@prql-bot, #6233)
+
 **Integrations**:
+
+- The `prqlc` JS/wasm package now reports an error for an unknown `target`,
+  rather than silently compiling to generic SQL. A typo such as
+  `opts.target = "sql.postgrez"` previously fell back to `sql.any`, so the
+  caller got working-but-wrong SQL with no signal. The Python and C bindings
+  already propagated this error; an unset (empty) `target` still means
+  `sql.any`. (@prql-bot, #6238)
+
+- The `prqlc` Python package now declares `requires-python = ">=3.10"`. Python
+  3.9 reached end-of-life in October 2025 and was never exercised by the test
+  matrix, which runs 3.10 and 3.12. The stale `>=3.9` claim also blocked every
+  Dependabot update to the binding's Python dependencies, because a pinned
+  candidate that itself requires 3.10+ leaves the 3.9 resolution fork
+  unsatisfiable. Users still on 3.9 continue to resolve the last release that
+  declared support for it. (@prql-bot, #6225)
 
 **Internal changes**:
 

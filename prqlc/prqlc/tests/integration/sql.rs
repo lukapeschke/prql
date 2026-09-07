@@ -3146,7 +3146,7 @@ fn test_f_string() {
           @"
     SELECT
       'Hello my name is ' || prefix || first_name || ' ' || last_name,
-      'and I am ' || year_born - now() || ' years old.'
+      'and I am ' || (year_born - now()) || ' years old.'
     FROM
       employees
     "
@@ -7111,6 +7111,89 @@ fn test_redshift_text_contains_uses_double_pipe() {
 }
 
 #[test]
+fn test_oracle_text_contains_uses_double_pipe() {
+    // https://github.com/PRQL/prql/issues/5751
+    // Oracle's CONCAT takes exactly two arguments before 23ai, so the generic
+    // three-argument form is invalid.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from employees
+    select {
+        name,
+        has_substring = (name | text.contains "pika")
+    }
+    "###, sql::Dialect::Oracle
+    ).unwrap(), @r#"
+    SELECT
+      "name",
+      "name" LIKE '%' || 'pika' || '%' AS "has_substring"
+    FROM
+      "employees"
+    "#);
+}
+
+#[test]
+fn test_oracle_text_contains_parenthesizes_additive_argument() {
+    // Oracle ranks binary `+`/`-` at the same precedence as `||`, evaluated
+    // left to right, so an unparenthesized argument would parse as
+    // `((('%' || first_name) + last_name) || '%')`.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from employees
+    select {
+        name,
+        has_substring = (name | text.contains (first_name + last_name))
+    }
+    "###, sql::Dialect::Oracle
+    ).unwrap(), @r#"
+    SELECT
+      "name",
+      "name" LIKE '%' || ("first_name" + "last_name") || '%' AS "has_substring"
+    FROM
+      "employees"
+    "#);
+}
+
+#[test]
+fn test_sqlite_text_pattern_parenthesizes_compound_argument() {
+    // SQLite ranks `||` above both `*`/`/`/`%` and `+`/`-`, so an
+    // unparenthesized argument binds to the surrounding `'%'` literals instead
+    // of to itself: `'%' || a + b || '%'` parses as `('%' || a) + (b || '%')`.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from employees
+    select {
+        c = (name | text.contains (first_name + last_name)),
+        s = (name | text.starts_with (first_name + last_name)),
+        e = (name | text.ends_with (first_name * last_name)),
+    }
+    "###, sql::Dialect::SQLite
+    ).unwrap(), @r"
+    SELECT
+      name LIKE '%' || (first_name + last_name) || '%' AS c,
+      name LIKE (first_name + last_name) || '%' AS s,
+      name LIKE '%' || (first_name * last_name) AS e
+    FROM
+      employees
+    ");
+}
+
+#[test]
+fn test_sqlite_text_pattern_leaves_simple_argument_unwrapped() {
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from employees
+    select {
+        c = (name | text.contains "pika"),
+        s = (name | text.starts_with first_name),
+    }
+    "###, sql::Dialect::SQLite
+    ).unwrap(), @r"
+    SELECT
+      name LIKE '%' || 'pika' || '%' AS c,
+      name LIKE first_name || '%' AS s
+    FROM
+      employees
+    ");
+}
+
+#[test]
 fn test_snowflake_row_number_requires_order_by() {
     // https://github.com/PRQL/prql/issues/5580
     // Snowflake requires ORDER BY for ROW_NUMBER() in window specification
@@ -7804,4 +7887,227 @@ fn test_append_by_name() {
     FROM
       bar
     "###);
+}
+
+#[test]
+fn test_sqlite_concat_parenthesizes_compound_operands() {
+    // SQLite emits `||` rather than `CONCAT`, and ranks `||` above both
+    // `*`/`/`/`%` and `+`/`-`, so an unparenthesized operand binds to the
+    // neighbouring pieces of the f-string instead of to itself:
+    // `'pre' || a * b || 'post'` parses as `('pre' || a) * (b || 'post')`.
+    // `BETWEEN` binds looser than `||` in both dialects, so it needs the same
+    // treatment: `a BETWEEN 1 AND 5 || 'x'` parses as
+    // `a BETWEEN 1 AND ('5' || 'x')`.
+    //
+    // An operand that is itself a `||` chain (`nest`) stays unparenthesized —
+    // `||` is associative, so it never needs wrapping against itself.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from x
+    derive {m = a * b, n = a + b, p = a == b, t = (a >= 1 && a <= 5), s = f"{a}{b}"}
+    select {
+        y = f"pre{m}post",
+        z = f"{n}x",
+        q = f"{p}x",
+        bt = f"{t}x",
+        w = f"{a}{b}{c}",
+        nest = f"{s}!",
+    }
+    "###, sql::Dialect::SQLite
+    ).unwrap(), @"
+    SELECT
+      'pre' || (a * b) || 'post' AS y,
+      (a + b) || 'x' AS z,
+      (a = b) || 'x' AS q,
+      (a BETWEEN 1 AND 5) || 'x' AS bt,
+      a || b || c AS w,
+      a || b || '!' AS nest
+    FROM
+      x
+    ");
+}
+
+#[test]
+fn test_redshift_concat_parenthesizes_comparison_operand() {
+    // Redshift inherits PostgreSQL's precedence, where `||` sits below binary
+    // `+`/`-` but above the comparison operators — so arithmetic operands need
+    // no parentheses while a comparison or a `BETWEEN` does.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from x
+    derive {m = a * b, n = a + b, p = a == b, t = (a >= 1 && a <= 5)}
+    select {
+        y = f"pre{m}post",
+        z = f"{n}x",
+        q = f"{p}x",
+        bt = f"{t}x",
+    }
+    "###, sql::Dialect::Redshift
+    ).unwrap(), @"
+    SELECT
+      'pre' || a * b || 'post' AS y,
+      a + b || 'x' AS z,
+      (a = b) || 'x' AS q,
+      (a BETWEEN 1 AND 5) || 'x' AS bt
+    FROM
+      x
+    ");
+}
+
+#[test]
+fn test_sqlite_concat_parenthesizes_text_pattern_operand() {
+    // The `text.*` definitions compile to a top-level `LIKE`, which binds
+    // looser than `||`. Without a `binding_strength` annotation they reported
+    // the s-string default of `100`, so an f-string operand was emitted bare
+    // and the trailing piece was swallowed into the pattern:
+    // `nm LIKE '%' || 'z' || '%' || '!'` matches `%z%!` rather than
+    // concatenating `'!'` onto the result.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from x
+    derive {c = (nm | text.contains "z"), s = (nm | text.starts_with "z"), e = (nm | text.ends_with "z")}
+    select {
+        y = f"{c}!",
+        z = f"{s}!",
+        w = f"{e}!",
+    }
+    "###, sql::Dialect::SQLite
+    ).unwrap(), @"
+    SELECT
+      (nm LIKE '%' || 'z' || '%') || '!' AS y,
+      (nm LIKE 'z' || '%') || '!' AS z,
+      (nm LIKE '%' || 'z') || '!' AS w
+    FROM
+      x
+    ");
+}
+
+#[test]
+fn test_redshift_concat_parenthesizes_text_pattern_operand() {
+    // Redshift emits `||` too, and only overrides `text.contains` — so
+    // `starts_with` and `ends_with` reach the same chain through the generic
+    // `CONCAT`-based definitions and need the annotation just as much.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from x
+    derive {c = (nm | text.contains "z"), s = (nm | text.starts_with "z"), e = (nm | text.ends_with "z")}
+    select {
+        y = f"{c}!",
+        z = f"{s}!",
+        w = f"{e}!",
+    }
+    "###, sql::Dialect::Redshift
+    ).unwrap(), @"
+    SELECT
+      (nm LIKE '%' || 'z' || '%') || '!' AS y,
+      (nm LIKE CONCAT('z', '%')) || '!' AS z,
+      (nm LIKE CONCAT('%', 'z')) || '!' AS w
+    FROM
+      x
+    ");
+}
+
+#[test]
+fn test_postgres_concat_leaves_text_pattern_operand_unwrapped() {
+    // Dialects with a `CONCAT` function pass operands as function arguments,
+    // where precedence is irrelevant — the annotation must not add parentheses
+    // there.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from x
+    derive c = (nm | text.contains "z")
+    select y = f"{c}!"
+    "###, sql::Dialect::Postgres
+    ).unwrap(), @"
+    SELECT
+      CONCAT(nm LIKE CONCAT('%', 'z', '%'), '!') AS y
+    FROM
+      x
+    ");
+}
+
+#[test]
+fn test_div_i_parenthesized_as_a_multiplication_operand() {
+    // The generic `div_i` body ends in `* SIGN(...) * SIGN(...)`, so its
+    // top-level operation is a multiplication, not the `FLOOR` call. It
+    // declared `100` anyway, so it was emitted bare and the trailing factors
+    // escaped the operand: `1 / FLOOR(...) * SIGN(a) * SIGN(b)` multiplies by
+    // the signs instead of dividing by the whole quotient.
+    assert_snapshot!(compile(r###"
+    from x
+    select {q = 1 / (a // b), plain = a // b}
+    "###).unwrap(), @r"
+    SELECT
+      1 / (FLOOR(ABS(a / b)) * SIGN(a) * SIGN(b)) AS q,
+      FLOOR(ABS(a / b)) * SIGN(a) * SIGN(b) AS plain
+    FROM
+      x
+    ");
+}
+
+#[test]
+fn test_sqlite_div_i_parenthesized_in_f_string() {
+    // SQLite overrides `div_i` with a body of the same shape, and ranks `||`
+    // above `*` — so an unparenthesized result binds its trailing `SIGN(b)` to
+    // the next f-string piece.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from x
+    derive d = (a // b)
+    select r = f"{d}!"
+    "###, sql::Dialect::SQLite
+    ).unwrap(), @r"
+    SELECT
+      (
+        CAST(ABS(a * 1.0 / b) AS INTEGER) * SIGN(a) * SIGN(b)
+      ) || '!' AS r
+    FROM
+      x
+    ");
+}
+
+#[test]
+fn test_postgres_div_i_left_unwrapped() {
+    // Postgres wraps its `div_i` in `TRUNC(...)` and declares `100` to match,
+    // so no parentheses should appear. (DuckDB has the same body but declares
+    // `11`, so it still gets a redundant pair — pre-existing, not covered here.)
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from x
+    select q = 1 / (a // b)
+    "###, sql::Dialect::Postgres
+    ).unwrap(), @r"
+    SELECT
+      (1 * 1.0 / TRUNC(a / b)) AS q
+    FROM
+      x
+    ");
+}
+
+#[test]
+fn test_math_log_parenthesized_as_a_division_operand() {
+    // `math.log` compiles to a top-level `/` but declared no
+    // `binding_strength`, so it reported the s-string default of `100`:
+    // `1 / LOG10(a) / LOG10(2)` is `1 / (log₁₀a · log₁₀2)`, not
+    // `1 / (log₁₀a / log₁₀2)`. This is dialect-independent.
+    assert_snapshot!(compile(r###"
+    from x
+    select {q = 1 / (a | math.log 2), plain = (a | math.log 2)}
+    "###).unwrap(), @r"
+    SELECT
+      1 / (LOG10(a) / LOG10(2)) AS q,
+      LOG10(a) / LOG10(2) AS plain
+    FROM
+      x
+    ");
+}
+
+#[test]
+fn test_sqlite_math_log_parenthesized_in_f_string() {
+    // On SQLite the same gap reaches the `||` chain, where the result would
+    // otherwise be evaluated as a bare number.
+    assert_snapshot!(compile_with_sql_dialect(r###"
+    from x
+    derive l = (a | math.log 2)
+    select r = f"{l}!"
+    "###, sql::Dialect::SQLite
+    ).unwrap(), @r"
+    SELECT
+      (LOG10(a) / LOG10(2)) || '!' AS r
+    FROM
+      x
+    ");
 }
